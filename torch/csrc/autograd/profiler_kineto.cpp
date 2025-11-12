@@ -541,10 +541,14 @@ void onFunctionExit(
       LOG(WARNING) << "Failed to record CUDA event. " << e.what();
     }
   } else if (config.state == ProfilerState::KINETO_PRIVATEUSE1_FALLBACK) {
-    auto fallback = kineto_ctx_ptr->fallback_;
-    TORCH_INTERNAL_ASSERT(fallback != nullptr);
-    torch::profiler::impl::privateuse1Stubs()->record(
-        nullptr, &fallback->device_event_end_, nullptr);
+    try {
+      auto fallback = kineto_ctx_ptr->fallback_;
+      TORCH_INTERNAL_ASSERT(fallback != nullptr);
+      torch::profiler::impl::privateuse1Stubs()->record(
+          nullptr, &fallback->device_event_end_, nullptr);
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "Failed to record PrivateUse1 end event. " << e.what();
+    }
   }
 
   if (!config.experimental_config.disable_external_correlation) {

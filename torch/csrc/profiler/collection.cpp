@@ -390,9 +390,13 @@ std::unique_ptr<KinetoObserverContext> ThreadLocalSubqueue::begin_op(
       LOG(WARNING) << "Failed to record CUDA event. " << e.what();
     }
   } else if (config_.state == ProfilerState::KINETO_PRIVATEUSE1_FALLBACK) {
-    out->fallback_ = torch_ops_.device_fallback_.emplace_back();
-    torch::profiler::impl::privateuse1Stubs()->record(
-        nullptr, &out->fallback_->device_event_start_, nullptr);
+    try {
+      out->fallback_ = torch_ops_.device_fallback_.emplace_back();
+      torch::profiler::impl::privateuse1Stubs()->record(
+          nullptr, &out->fallback_->device_event_start_, nullptr);
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "Failed to record PrivateUse1 event. " << e.what();
+    }
   }
 
   event->start_time_ = c10::getApproximateTime();

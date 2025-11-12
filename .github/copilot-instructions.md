@@ -37,21 +37,32 @@ After editing `native_functions.yaml`, implement kernels in `aten/src/ATen/nativ
 
 ## Development Workflows
 
-### Building from Source
+### Execute Commands
 
-**Never run `setup.py` directly** - use pip with editable install:
+**Always** run commands inside the conda environment:
 ```bash
-python -m pip install --no-build-isolation -v -e .
+conda activate pytorch-dev
 ```
 
-Speed up builds:
-- `DEBUG=1` - Debug symbols with `-g -O0`
-- `USE_CUDA=0` - Skip CUDA compilation
-- `BUILD_TEST=0` - Skip C++ test binaries
-- Install `ninja` (`pip install ninja`) for faster builds
-- Use `ccache` for incremental compilation caching
 
-Rebuild specific targets: `(cd build && ninja <target>)`
+### Building from Source
+
+**Always** activate conda virtual environment first:
+```bash
+conda activate pytorch-dev
+```
+
+**Build PyTorch** ONLY by
+```bash
+export CMAKE_PREFIX_PATH=$CONDA_PREFIX && export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH && MAX_JOBS=16 DEBUG=1 USE_CUDA=1 USE_KINETO=1 BUILD_CAFFE2=0 USE_DISTRIBUTED=1 USE_NCCL=1 BUILD_TEST=1 USE_XNNPACK=1 USE_FBGEMM=1 USE_QNNPACK=1 USE_MKLDNN=1 USE_MIOPEN=1 USE_NNPACK=1 BUILD_CAFFE2_OPS=0 USE_TENSORPIPE=1 python setup.py develop
+```
+
+**Build PyTorch OpenReg** ONLY by
+```bash
+cd test/cpp_extensions/open_registration_extension/torch_openreg
+pip install --no-build-isolation -e .
+```
+
 
 ### Testing
 
@@ -119,6 +130,30 @@ git stash pop
 - `GLOSSARY.md` - Terminology (ATen, kernels, operations, JIT, TorchScript)
 - `aten/src/ATen/native/README.md` - Operator implementation guide
 - `tools/autograd/derivatives.yaml` - Gradient definitions for autograd
+
+## Profiler Architecture
+
+**Two-layer profiling system:**
+- **`torch.autograd.profiler`** (`torch/autograd/profiler.py`) - Legacy backend with direct C++ bindings
+- **`torch.profiler.profiler`** (`torch/profiler/profiler.py`) - Modern frontend that wraps legacy profiler
+
+Modern profiler creates legacy profiler in `_KinetoProfile.prepare_trace()` (line 195):
+```python
+self.profiler = prof.profile(...)  # Wraps torch.autograd.profiler.profile
+```
+
+**C++ profiler implementation:**
+- `torch/csrc/autograd/profiler_kineto.cpp` - Main Kineto integration
+- `torch/csrc/profiler/kineto_shim.cpp` - libkineto abstraction layer
+- `torch/csrc/profiler/orchestration/observer.h` - Observer pattern for profiling events
+- `torch/csrc/profiler/standalone/privateuse1_observer.h` - Custom backend profiling support
+
+**PrivateUse1 backend limitations:**
+- Uses `ProfilerState::KINETO_PRIVATEUSE1_FALLBACK` (CPU timing only)
+- No automatic device kernel tracing (unlike CUDA with CUPTI)
+- Must manually instrument with `RECORD_FUNCTION()` for device-side events
+
+**Testing:** Run specific profiler tests only: `python test/profiler/test_profiler.py TestProfiler::test_kineto`
 
 ## Performance Debugging
 
