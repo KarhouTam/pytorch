@@ -26,6 +26,7 @@ from torch._environment import is_fbcode
 from torch._utils_internal import profiler_allow_cudagraph_cupti_lazy_reinit_cuda12
 from torch.autograd import kineto_available, ProfilerActivity
 from torch.profiler._memory_profiler import MemoryProfile, MemoryProfileTimeline
+from torch.profiler.backend import DeviceProfilerRegistry, ProfilerBackend
 
 
 __all__ = [
@@ -95,6 +96,10 @@ class _ITraceObserver(ABC):
 class _KinetoProfile:
     """Low-level profiler wrap the autograd profile
 
+    REFACTORED: This class now uses the new ProfilerBackend system for device-agnostic
+    profiling. Out-of-tree backends can register their own profilers via
+    DeviceProfilerRegistry without modifying this code.
+
     Args:
         activities (iterable): list of activity groups (CPU, CUDA) to use in profiling, supported values:
             ``torch.profiler.ProfilerActivity.CPU``, ``torch.profiler.ProfilerActivity.CUDA``,
@@ -160,21 +165,40 @@ class _KinetoProfile:
         self.has_cudagraphs = False
         self.mem_tl: Optional[MemoryProfileTimeline] = None
         self.use_device = None
+
+        # NEW: Device-specific backend for profiling
+        self.device_backend: Optional[ProfilerBackend] = None
+
         if ProfilerActivity.CUDA in self.activities:
             # pyrefly: ignore [bad-assignment]
             self.use_device = "cuda"
+            self.device_backend = DeviceProfilerRegistry.get_backend("cuda")
         elif ProfilerActivity.XPU in self.activities:
             # pyrefly: ignore [bad-assignment]
             self.use_device = "xpu"
+            self.device_backend = DeviceProfilerRegistry.get_backend("xpu")
         elif ProfilerActivity.MTIA in self.activities:
             # pyrefly: ignore [bad-assignment]
             self.use_device = "mtia"
+            self.device_backend = DeviceProfilerRegistry.get_backend("mtia")
         elif ProfilerActivity.HPU in self.activities:
             # pyrefly: ignore [bad-assignment]
             self.use_device = "hpu"
+            self.device_backend = DeviceProfilerRegistry.get_backend("hpu")
         elif ProfilerActivity.PrivateUse1 in self.activities:
             # pyrefly: ignore [bad-assignment]
             self.use_device = _get_privateuse1_backend_name()
+            # Try to get custom backend first
+            self.device_backend = DeviceProfilerRegistry.get_backend(self.use_device)
+            if self.device_backend is None:
+                # Fall back to default if no custom backend registered
+                warn(
+                    f"No custom profiler backend registered for {self.use_device}. "
+                    "Using fallback profiler with CPU-only timing. "
+                    "For better profiling support, register a ProfilerBackend via "
+                    "DeviceProfilerRegistry.register_backend()",
+                    stacklevel=2,
+                )
 
         # user-defined metadata to be amended to the trace
         self.preset_metadata: dict[str, str] = {}
@@ -212,6 +236,28 @@ class _KinetoProfile:
             self.execution_trace_observer.start()
         assert self.profiler is not None
         self.profiler._start_trace()
+
+        # NEW: Call device backend start if registered
+        # For Kineto-supported devices (CUDA/XPU/MTIA/HPU), this is a no-op
+        # For custom PrivateUse1 backends, this enables device-specific profiling
+        if self.device_backend is not None:
+            backend_config = {
+                "record_shapes": self.record_shapes,
+                "profile_memory": self.profile_memory,
+                "with_stack": self.with_stack,
+                "with_flops": self.with_flops,
+                "with_modules": self.with_modules,
+                "activities": self.activities,
+            }
+            try:
+                self.device_backend.prepare(backend_config)
+                self.device_backend.start()
+            except Exception as e:
+                warn(
+                    f"Failed to start device backend for {self.use_device}: {e}. "
+                    "Continuing with fallback profiling.",
+                    stacklevel=2,
+                )
 
         if self.profile_memory:
             self.add_metadata_json("profile_memory", "1")
@@ -254,6 +300,26 @@ class _KinetoProfile:
                 self.add_metadata_json(k, v)
 
     def stop_trace(self) -> None:
+        # NEW: Synchronize and stop device backend
+        # For Kineto-supported devices: synchronize() ensures device ops complete
+        # For custom PrivateUse1: stop() + get_results() collect custom profiling data
+        if self.device_backend is not None:
+            try:
+                self.device_backend.synchronize()
+                self.device_backend.stop()
+                
+                # Get results from backend and add to metadata
+                # (no-op for Kineto devices, custom data for PrivateUse1)
+                results = self.device_backend.get_results()
+                for key, value in results.items():
+                    if isinstance(value, str):
+                        self.add_metadata_json(f"backend_{key}", value)
+            except Exception as e:
+                warn(
+                    f"Failed to stop device backend for {self.use_device}: {e}",
+                    stacklevel=2,
+                )
+
         if self.execution_trace_observer:
             self.execution_trace_observer.stop()
         assert self.profiler is not None
