@@ -46,5 +46,35 @@ PrivateUse1TestBase.op_decorators = {
 
 instantiate_device_type_tests(TestDeviceTypeOpenReg, globals(), only_for=("openreg",))
 
+
+# Test that individual test methods can be skipped via skipped_testcases.
+# test_skipped_method should never run; if it does, the test suite will fail.
+class TestSkippedTestcases(TestCase):
+    def test_skipped_method(self, device):
+        self.fail("test_skipped_method should have been skipped via skipped_testcases")
+
+    def test_non_skipped_method(self, device):
+        # This method is NOT listed in skipped_testcases and should run normally.
+        pass
+
+
+# Test that an entire class can be skipped via skipped_testcases = ["*"].
+# If any test method in this class runs, the test suite will fail.
+class TestSkippedTestcasesAll(TestCase):
+    def test_would_fail(self, device):
+        self.fail(
+            "TestSkippedTestcasesAll should have been entirely skipped "
+            "via skipped_testcases with '*'"
+        )
+
+
+PrivateUse1TestBase.skipped_testcases = {
+    "TestSkippedTestcases": ["test_skipped_method"],
+    "TestSkippedTestcasesAll": ["*"],
+}
+
+instantiate_device_type_tests(TestSkippedTestcases, globals(), only_for=("openreg",))
+instantiate_device_type_tests(TestSkippedTestcasesAll, globals(), only_for=("openreg",))
+
 if __name__ == "__main__":
     run_tests()

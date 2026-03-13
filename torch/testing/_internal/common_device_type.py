@@ -318,6 +318,10 @@ def _update_param_kwargs(param_kwargs, name, value):
 class DeviceTypeTestBase(TestCase):
     device_type: str = "generic_device_type"
 
+    # skipped_testcases is a dict mapping test class names to lists of test method names to skip.
+    # If a test method name is "*", all tests in that class will be skipped.
+    skipped_testcases = None  # type: Optional[dict[str, list[str]]]
+
     # Decorators and skips to apply to tests that are parametrized by ops.
     op_decorators = None  # type: Optional[dict[str, list[DecorateInfo]]]
     op_skips = None  # type: Optional[dict[str, list[DecorateInfo]]]
@@ -344,6 +348,17 @@ class DeviceTypeTestBase(TestCase):
     @rel_tol.setter
     def rel_tol(self, prec):
         self._tls.rel_tol = prec
+
+    @classmethod
+    def get_skipped_testcases(cls, test_class_name):
+        if (
+            cls.skipped_testcases
+            and test_class_name in cls.skipped_testcases
+            and cls.skipped_testcases[test_class_name] is not None
+        ):
+            return cls.skipped_testcases[test_class_name]
+        else:
+            return []
 
     @classmethod
     def update_op_list(cls, ops):
@@ -935,6 +950,10 @@ def instantiate_device_type_tests(
     ):
         class_name = generic_test_class.__name__ + base.device_type.upper()
 
+        skipped_testcases = base.get_skipped_testcases(generic_test_class.__name__)
+        if len(skipped_testcases) == 1 and skipped_testcases[0] == "*":
+            # If the test class is entirely skipped, we can skip creating the test class at all.
+            continue
         # type set to Any and suppressed due to unsupported runtime class:
         # https://github.com/python/mypy/wiki/Unsupported-Python-Features
         device_type_test_class: Any = type(class_name, (base, generic_test_class), {})
@@ -964,6 +983,8 @@ def instantiate_device_type_tests(
 
         for name in generic_members:
             if name in generic_tests:  # Instantiates test member
+                if name in skipped_testcases:
+                    continue
                 test = getattr(generic_test_class, name)
                 # XLA-compat shim (XLA's instantiate_test takes doesn't take generic_cls)
                 sig = inspect.signature(device_type_test_class.instantiate_test)
