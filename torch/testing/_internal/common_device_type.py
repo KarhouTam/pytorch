@@ -318,6 +318,9 @@ def _update_param_kwargs(param_kwargs, name, value):
 class DeviceTypeTestBase(TestCase):
     device_type: str = "generic_device_type"
 
+    # Decorators and skips to apply to tests that are parametrized by ops.
+    op_decorators = None  # type: Optional[dict[str, list[DecorateInfo]]]
+    op_skips = None  # type: Optional[dict[str, list[DecorateInfo]]]
     # Flag to disable test suite early due to unrecoverable error such as CUDA error.
     _stop_test_suite = False
 
@@ -341,6 +344,31 @@ class DeviceTypeTestBase(TestCase):
     @rel_tol.setter
     def rel_tol(self, prec):
         self._tls.rel_tol = prec
+
+    @classmethod
+    def update_op_list(cls, ops):
+        op_dict = {op.full_name: op for op in copy.deepcopy(ops.op_list)}
+
+        if cls.op_decorators is not None:
+            for op_name, decorators in cls.op_decorators.items():
+                for decorator in decorators:
+                    if cls.device_type == "privateuse1":
+                        decorator.device_type = torch._C._get_privateuse1_backend_name()
+                    else:
+                        decorator.device_type = cls.device_type
+                    op_dict[op_name].decorators += (decorator,)
+
+        if cls.op_skips is not None:
+            for op_name, skips in cls.op_skips.items():
+                for skip in skips:
+                    if cls.device_type == "privateuse1":
+                        skip.device_type = torch._C._get_privateuse1_backend_name()
+                    else:
+                        skip.device_type = cls.device_type
+                    op_dict[op_name].skips += (skip,)
+                    op_dict[op_name].decorators += (skip,)
+
+        ops.op_list = list(op_dict.values())
 
     # Returns a string representing the device that single device tests should use.
     # Note: single device tests use this device exclusively.
@@ -1084,6 +1112,7 @@ class ops(_TestParametrizer):
                 "instantiate_parametrized_tests()"
             )
 
+        device_cls.update_op_list(self)
         op = check_exhausted_iterator = object()
         for op in self.op_list:
             # Determine the set of dtypes to use.
