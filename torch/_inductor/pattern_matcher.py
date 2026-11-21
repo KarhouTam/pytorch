@@ -61,6 +61,7 @@ import torch.fx
 import torch.utils._pytree as pytree
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.utils import counters
+from torch._logging import trace_structured
 from torch._prims_common import canonicalize_dim, is_integer_dtype
 from torch._subclasses.fake_tensor import (
     is_fake_tensor,
@@ -105,26 +106,30 @@ _debug_nodes_cache: bool | OrderedSet[str] | None = None
 _debug_nodes_env_value_cache: str | None = None
 
 
+def _get_debug_nodes() -> bool | OrderedSet[str]:
+    """Parse TORCHINDUCTOR_PATTERN_MATCH_DEBUG: unset -> off, "all" -> full
+    debug, anything else (including the conventional "__none__") -> a
+    node-name whitelist."""
+    global _debug_nodes_cache, _debug_nodes_env_value_cache
+
+    def parse_debug_env(env_value: str | None) -> bool | OrderedSet[str]:
+        if not env_value:
+            return False
+        if env_value == "all":
+            return True
+        return OrderedSet(env_value.split(","))
+
+    current_env = os.environ.get("TORCHINDUCTOR_PATTERN_MATCH_DEBUG")
+
+    # Recompute only if env changed
+    if current_env != _debug_nodes_env_value_cache or _debug_nodes_cache is None:
+        _debug_nodes_cache = parse_debug_env(current_env)
+        _debug_nodes_env_value_cache = current_env
+
+    return _debug_nodes_cache
+
+
 def _should_debug_node(node_name: str) -> bool:
-    def _get_debug_nodes() -> bool | OrderedSet[str]:
-        global _debug_nodes_cache, _debug_nodes_env_value_cache
-
-        def parse_debug_env(env_value: str | None) -> bool | OrderedSet[str]:
-            if not env_value:
-                return False
-            if env_value == "all":
-                return True
-            return OrderedSet(env_value.split(","))
-
-        current_env = os.environ.get("TORCHINDUCTOR_PATTERN_MATCH_DEBUG")
-
-        # Recompute only if env changed
-        if current_env != _debug_nodes_env_value_cache or _debug_nodes_cache is None:
-            _debug_nodes_cache = parse_debug_env(current_env)
-            _debug_nodes_env_value_cache = current_env
-
-        return _debug_nodes_cache
-
     debug_nodes = _get_debug_nodes()
     if isinstance(debug_nodes, bool):
         return debug_nodes
@@ -256,6 +261,9 @@ class Match:
     targets: dict[_TargetExpr, torch.fx.node.Target]
     ctx: MatchContext
     replacement_graph: torch.fx.GraphModule | None
+    # set by register_replacement's check_fn on specific re-trace /
+    # re-match / extra_check failures: (outcome, debug reason head)
+    check_failure: tuple[str, str] | None
 
     def __init__(
         self,
@@ -275,6 +283,7 @@ class Match:
         self.targets = {}
         self.ctx = ctx
         self.replacement_graph = None
+        self.check_failure = None
 
     @property
     def graph(self) -> torch.fx.Graph:
@@ -457,6 +466,10 @@ class FailedMatch(RuntimeError):
     """
 
     format_string: str
+    # how much of the pattern matched before the failure, filled in by
+    # PatternExpr.match; used for near-miss ranking, never for control flow
+    matched: int = 0
+    attempted: int = 0
 
     def __init__(self, format_string: str, *args: Any, **kwargs: Any) -> None:
         self.format_string = format_string
@@ -508,6 +521,8 @@ class MatchContext:
         self.pattern_to_node = {} if pattern_to_node is None else dict(pattern_to_node)
         self.graph = graph
         self.exclusive_node_set = []
+        # number of sub-patterns that matched before this attempt gave up
+        self.n_matched = 0
 
     def match(self, pattern: PatternExpr, node: NodeOrConstant) -> MatchResult:
         """wrapper to check reused nodes in patterns"""
@@ -520,6 +535,8 @@ class MatchContext:
         if pattern in self.pattern_to_node:
             raise AssertionError("pattern already present in pattern_to_node")
         self.pattern_to_node[pattern] = node if m else None
+        if m:
+            self.n_matched += 1
         return m
 
     def filter_multi_user_patterns(self) -> dict[PatternExpr, torch.fx.Node]:
@@ -539,14 +556,22 @@ class PatternExpr(ABC):
     def _match(self, node: torch.fx.Node, ctx: MatchContext) -> MatchResult: ...
 
     def match(self, node: torch.fx.Node) -> MatchResult:
+        ctx = MatchContext([self], graph=node.graph)
         try:
-            return MatchContext([self], graph=node.graph).match(self, node)
+            result = ctx.match(self, node)
         except FailedMatch as e:
             # Drop the traceback: the caller keeps the returned FailedMatch in a
             # local, and its traceback would hold this frame and, via f_back, the
             # whole calling stack (e.g. the autograd backward that triggered a
             # lazy backward compile, with its real tensors) in a reference cycle.
-            return e.with_traceback(None)
+            result = e.with_traceback(None)
+        if not is_match(result):
+            # How far the attempt got, for near-miss ranking (see PatternMatcherPass).
+            # Sub-pattern failures are usually *returned*, not raised, so this must
+            # run on both paths.
+            result.matched = ctx.n_matched
+            result.attempted = len(ctx.pattern_to_node)
+        return result
 
     def has_multiple_users(self) -> bool:
         return False
@@ -1112,6 +1137,7 @@ class _TargetArgsExpr(_TargetExpr):
         if len(node_items) != len(self_items):
             raise AssertionError("node_items and self_items length mismatch")
 
+        ctx.n_matched += 1  # this node matched structurally, even if children do not
         m = Match(ctx, self)
         for pattern, child_node in zip(self_items, node_items):
             if isinstance(pattern, PatternExpr):
@@ -1238,6 +1264,7 @@ class _TargetExprVarArgs(_TargetExpr):
         if not self._match_users(node, ctx):
             return FailedMatch("multiple_users")
 
+        ctx.n_matched += 1  # this node matched structurally
         m = Match(ctx, self)
         m.nodes.append(node)
         m.targets[self] = node.target
@@ -2075,6 +2102,7 @@ def register_replacement(
 
         Recheck the match with the correct shapes.
         """
+        match.check_failure = None
         structured_match_kwargs = _unflatten_match_kwargs(
             match.kwargs, initial_arg_info
         )
@@ -2120,6 +2148,7 @@ def register_replacement(
 
             args = pytree.tree_map(refresh_arg, args)
             if invalid_args:
+                match.check_failure = ("invalid_args", "")
                 return False
 
             # Re-trace search_fn with the matched inputs to validate the match
@@ -2153,6 +2182,7 @@ def register_replacement(
                         )
                     except Exception as e:
                         log_trace_failure(search_fn, e)
+                        match.check_failure = ("specific_trace_fail", "trace_failure")
                         return False
 
                     # correct argnames in the graph
@@ -2186,6 +2216,7 @@ def register_replacement(
                         # not fit search_fn at all (e.g. a rank-3 graph
                         # against a pattern that indexes query.size(3))
                         log_trace_failure(search_fn, e)
+                        match.check_failure = ("specific_trace_fail", "trace_failure")
                         return False
 
                 specific_pattern = fx_to_pattern(
@@ -2234,6 +2265,14 @@ def register_replacement(
                             pass_name="replacement",
                         )
                 return True
+
+            if is_match(specific_pattern_match):
+                match.check_failure = ("extra_check_reject", "")
+            else:
+                match.check_failure = (
+                    "specific_fail",
+                    _debug_reason(specific_pattern_match, _get_debug_nodes() is True),
+                )
             return False
 
     def normalize_args(**kwargs: Any) -> list[Any]:
@@ -2782,6 +2821,18 @@ def _wrap_bound_method(fn: Any, argnames: list[str]) -> Any:
     return wrapper
 
 
+def _debug_reason(m: MatchResult, enabled: bool) -> str:
+    """Failure text for the debug artifact only, so callers must say whether the
+    artifact is being built: formatting `str(m)` on every attempt is expensive."""
+    if not enabled or is_match(m):
+        return ""
+    return _tsv_field(str(m)) or "failed"
+
+
+def _tsv_field(value: str, limit: int = 160) -> str:
+    return value.replace("\t", " ").replace("\n", " ")[:limit]
+
+
 class PatternMatcherPass:
     """
     Registry of patterns to match and replace in FX graphs.
@@ -2839,6 +2890,33 @@ class PatternMatcherPass:
         pass_name = self.pass_name if self.pass_name is not None else "pattern_matcher"
         if not isinstance(gm, torch.fx.GraphModule):
             raise AssertionError(f"expected GraphModule, got {type(gm)}")
+
+        # Miss counters are always on; per-site records are only materialized
+        # in full debug mode.
+        debug_misses = _get_debug_nodes() is True
+        # ("pass", "node", "target", "pattern", "bucket", "matched", "reason")
+        miss_records: list[tuple[str, str, str, str, str, str, str]] = []
+
+        def record_miss(
+            entry: PatternEntry | None,
+            node: torch.fx.Node,
+            target: torch.fx.node.Target,
+            bucket: str,
+            reason: str = "",
+            matched: str = "",
+        ) -> None:
+            name = getattr(entry, "pattern_name", None)
+            if name:
+                counters[backend][f"pattern_matcher_miss::{name}|{bucket}"] += 1
+            if debug_misses:
+                # classes/functions repr with their address; keep the column reproducible
+                if isinstance(target, type) or inspect.isroutine(target):
+                    tgt = getattr(target, "__qualname__", None) or target.__name__
+                else:
+                    tgt = str(target)
+                head = (pass_name, node.name, str(tgt), name or "", bucket)
+                miss_records.append((*head, matched, reason))
+
         with GraphTransformObserver(gm, pass_name, self.subsystem):
             for node in sorted(itertools.chain.from_iterable(nodes), reverse=True):
                 target = extract_target(node)
@@ -2846,29 +2924,44 @@ class PatternMatcherPass:
                     if (node.op, target) not in self.patterns:
                         continue
 
+                key = (node.op, target)
+                entries = self.patterns.get(key)
+                if not entries:
+                    continue
+
                 # conservatively not applying pattern for cpu input,
                 # since some of the patterns induce codegen and split nodes.
                 # Note: we will only skip cpu compute if disable_cpp_codegen=True
                 if fallback_node_due_to_unsupported_type(node, allow_cpu_inputs=False):
+                    # no pattern was attempted: artifact only, never a counter
+                    record_miss(None, node, target, "skipped")
                     continue
 
-                for entry in self.patterns[(node.op, target)]:
+                for entry in entries:
                     if node._erased:
                         break
                     m = entry.pattern.match(node)
+                    if not is_match(m):
+                        record_miss(
+                            entry,
+                            node,
+                            target,
+                            "coarse_fail",
+                            _debug_reason(m, debug_misses),
+                            f"{m.matched}/{m.attempted}",
+                        )
+                        continue
+
                     # pattern match crosses mutation barrier - discard
                     if (
-                        is_match(m)
-                        and len(
-                            OrderedSet(map(get_mutation_region_id_partial, m.nodes))
-                        )
+                        len(OrderedSet(map(get_mutation_region_id_partial, m.nodes)))
                         != 1
                     ):
+                        record_miss(entry, node, target, "discarded")
                         continue
                     # pattern match crosses stream boundary - discard
                     if (
-                        is_match(m)
-                        and len(
+                        len(
                             OrderedSet(
                                 (
                                     n.meta.get("custom", {}).get("stream", 0),
@@ -2880,11 +2973,12 @@ class PatternMatcherPass:
                         )
                         != 1
                     ):
+                        record_miss(entry, node, target, "discarded")
                         continue
                     if _should_debug_node(node.name):
                         log.warning("%s%s %s %s", node, node.args, m, entry.pattern)
 
-                    if is_match(m) and guard_or_false(entry.extra_check(m)):
+                    if guard_or_false(entry.extra_check(m)):
                         count += 1
                         if isinstance(entry, ReplacementPatternEntry):
                             mutation_region_refresh = (
@@ -2913,18 +3007,48 @@ class PatternMatcherPass:
                         counters[backend]["pattern_matcher_count"] += 1
                         counters[backend]["pattern_matcher_nodes"] += len(m.nodes)
 
+                        pattern_name = getattr(entry, "pattern_name", None)
+                        if pattern_name:
+                            hit_key = f"pattern_matcher_hit::{pattern_name}"
+                            counters[backend][hit_key] += 1
+
                         # Track per-pattern counts when debug mode is active
                         if os.environ.get("TORCHINDUCTOR_PATTERN_MATCH_DEBUG"):
-                            if getattr(entry, "pattern_name", None):
-                                pattern_name = entry.pattern_name
-                            else:
+                            if not pattern_name:
                                 # Fallback: use pattern class name + operation target
                                 pattern_class = entry.pattern.__class__.__name__
-                                target = str(node.target)
-                                pattern_name = f"{pattern_class}_{target}"
+                                pattern_target = str(node.target)
+                                pattern_name = f"{pattern_class}_{pattern_target}"
 
                             pattern_key = f"{backend}_pattern_matcher_per_pattern"
                             counters[pattern_key][pattern_name] += 1
+                    else:
+                        layer, reason = m.check_failure or ("extra_check_reject", "")
+                        record_miss(
+                            entry,
+                            node,
+                            target,
+                            "rejected",
+                            f"{layer}: {reason}" if reason else layer,
+                        )
+
+        if debug_misses:
+            # Emit even when there is nothing to report: an artifact with only
+            # the header means "this pass ran and nothing missed", which is not
+            # the same as "this pass did not run" (no artifact at all).
+            header = "\t".join(
+                ("pass", "node", "target", "pattern", "bucket", "matched", "reason")
+            )
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "pattern_matcher_misses",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: "\n".join(
+                    [header, *("\t".join(map(_tsv_field, row)) for row in miss_records)]
+                ),
+            )
         return count
 
     def clear(self) -> None:

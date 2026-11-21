@@ -4489,6 +4489,288 @@ class TestPatternMatcherLogging(LoggingTestCase):
             self.assertIn(torch.ops._test_pm.replacement_op.default, op_targets)
 
 
+class TestPatternMatcherMissTelemetry(TestCase):
+    """Counters for pattern entries that were tried but did not replace."""
+
+    @staticmethod
+    def _add_graph():
+        return make_fx(lambda x: torch.add(x, x))(torch.randn(8))
+
+    @staticmethod
+    def _register(search, replace, patterns, example_inputs=None, **kwargs):
+        register_replacement(
+            search,
+            replace,
+            example_inputs or [torch.randn(8)],
+            fwd_only,
+            pass_dicts=patterns,
+            **kwargs,
+        )
+
+    def test_hit_counter(self):
+        patterns = PatternMatcherPass(pass_name="tel_hit")
+        self._register(
+            lambda x: torch.add(x, x),
+            lambda x: torch.sub(x, x),
+            patterns,
+            pattern_name="hit_family",
+        )
+        counters.clear()
+        self.assertEqual(patterns.apply(self._add_graph()), 1)
+
+        self.assertEqual(counters["inductor"]["pattern_matcher_hit::hit_family"], 1)
+        self.assertNotIn(
+            "pattern_matcher_miss::hit_family|coarse_fail", counters["inductor"]
+        )
+
+    def test_coarse_fail_counter(self):
+        # A literal in search_fn is a wildcard at the coarse level, so use a
+        # structurally different pattern to trigger a coarse mismatch.
+        patterns = PatternMatcherPass(pass_name="tel_coarse")
+        self._register(
+            lambda x, y: torch.add(torch.add(x, y), y),
+            lambda x, y: x,
+            patterns,
+            example_inputs=[torch.randn(8), torch.randn(8)],
+            pattern_name="coarse_family",
+        )
+        counters.clear()
+        self.assertEqual(patterns.apply(self._add_graph()), 0)
+
+        self.assertEqual(
+            counters["inductor"]["pattern_matcher_miss::coarse_family|coarse_fail"], 1
+        )
+        self.assertNotIn("pattern_matcher_hit::coarse_family", counters["inductor"])
+
+    def test_extra_check_reject_is_counted_and_explained(self):
+        patterns = PatternMatcherPass(pass_name="tel_reject")
+        self._register(
+            lambda x: torch.add(x, x),
+            lambda x: torch.sub(x, x),
+            patterns,
+            extra_check=lambda match: False,
+            pattern_name="rejected_family",
+        )
+        counters.clear()
+        with (
+            unittest.mock.patch.dict(
+                os.environ, {"TORCHINDUCTOR_PATTERN_MATCH_DEBUG": "all"}
+            ),
+            unittest.mock.patch.object(pattern_matcher, "trace_structured") as trace,
+        ):
+            self.assertEqual(patterns.apply(self._add_graph()), 0)
+
+        self.assertEqual(
+            counters["inductor"]["pattern_matcher_miss::rejected_family|rejected"], 1
+        )
+        trace.assert_called_once()
+        self.assertEqual(
+            trace.call_args.kwargs["metadata_fn"]()["name"], "pattern_matcher_misses"
+        )
+        self.assertIn(
+            "\trejected\t\textra_check_reject", trace.call_args.kwargs["payload_fn"]()
+        )
+
+    def test_trace_fail_reason_is_layered(self):
+        def search(x):
+            if x.dim() > 1:
+                raise RuntimeError("expected 1D input")
+            return torch.add(x, x)
+
+        patterns = PatternMatcherPass(pass_name="tel_trace")
+        self._register(
+            search, lambda x: torch.sub(x, x), patterns, pattern_name="trace_family"
+        )
+        gm = make_fx(lambda x: torch.add(x, x).div(2.0))(torch.randn(4, 8))
+        counters.clear()
+        with (
+            unittest.mock.patch.dict(
+                os.environ, {"TORCHINDUCTOR_PATTERN_MATCH_DEBUG": "all"}
+            ),
+            unittest.mock.patch.object(pattern_matcher, "trace_structured") as trace,
+        ):
+            patterns.apply(gm)
+
+        # A re-trace failure shares the "rejected" bucket with an explicit
+        # predicate rejection, but the artifact keeps the two layers apart.
+        self.assertEqual(
+            counters["inductor"]["pattern_matcher_miss::trace_family|rejected"], 1
+        )
+        self.assertIn(
+            "\trejected\t\tspecific_trace_fail: trace_failure",
+            trace.call_args.kwargs["payload_fn"](),
+        )
+
+    def test_unnamed_pattern_has_no_counter(self):
+        patterns = PatternMatcherPass(pass_name="tel_anon")
+        register_graph_pattern(
+            CallFunction(torch.ops.aten.add.Tensor, Arg(), Arg()),
+            pass_dict=patterns,
+        )(lambda match, x, y: None)
+        counters.clear()
+        self.assertEqual(patterns.apply(self._add_graph()), 1)
+
+        self.assertEqual(counters["inductor"]["pattern_matcher_count"], 1)
+        self.assertFalse(
+            any(
+                key.startswith(("pattern_matcher_hit::", "pattern_matcher_miss::"))
+                for key in counters["inductor"]
+            )
+        )
+
+    def test_matched_depth_separates_near_miss_from_shallow_failure(self):
+        patterns = PatternMatcherPass(pass_name="tel_depth")
+        # matches the add, the mul and both args before failing on the second arg
+        self._register(
+            lambda x, y: torch.add(torch.mul(x, y), torch.sub(x, y)),
+            lambda x, y: x,
+            patterns,
+            example_inputs=[torch.randn(8), torch.randn(8)],
+            pattern_name="deep_family",
+        )
+        # matches only the add, then fails on its first argument
+        self._register(
+            lambda x, y: torch.add(torch.sub(x, y), torch.sub(x, y)),
+            lambda x, y: x,
+            patterns,
+            example_inputs=[torch.randn(8), torch.randn(8)],
+            pattern_name="shallow_family",
+        )
+        counters.clear()
+        with (
+            unittest.mock.patch.dict(
+                os.environ, {"TORCHINDUCTOR_PATTERN_MATCH_DEBUG": "all"}
+            ),
+            unittest.mock.patch.object(pattern_matcher, "trace_structured") as trace,
+        ):
+            gm = make_fx(lambda x, y: torch.add(torch.mul(x, y), y))(
+                torch.randn(8), torch.randn(8)
+            )
+            patterns.apply(gm)
+
+        rows = [
+            row.split("\t")
+            for row in trace.call_args.kwargs["payload_fn"]().split("\n")[1:]
+        ]
+        depth = {r[3]: int(r[5].split("/")[0]) for r in rows if r[3]}
+        self.assertGreater(depth["deep_family"], depth["shallow_family"])
+        self.assertEqual(depth["shallow_family"], 1)
+
+    def test_discarded_bucket_on_stream_boundary(self):
+        gm = make_fx(lambda x, y: torch.add(torch.mul(x, x), y))(
+            torch.randn(8), torch.randn(8)
+        )
+        for stream, node in enumerate(
+            n for n in gm.graph.nodes if n.op == "call_function"
+        ):
+            node.meta.setdefault("custom", {})["stream"] = stream
+
+        patterns = PatternMatcherPass(pass_name="tel_discard")
+        self._register(
+            lambda x, y: torch.add(torch.mul(x, x), y),
+            lambda x, y: x,
+            patterns,
+            example_inputs=[torch.randn(8), torch.randn(8)],
+            pattern_name="discarded_family",
+        )
+        counters.clear()
+        self.assertEqual(patterns.apply(gm), 0)
+
+        self.assertEqual(
+            counters["inductor"]["pattern_matcher_miss::discarded_family|discarded"],
+            1,
+        )
+        self.assertNotIn("pattern_matcher_hit::discarded_family", counters["inductor"])
+
+    def test_debug_artifact_does_not_change_counters(self):
+        def build():
+            patterns = PatternMatcherPass(pass_name="tel_invariant")
+            self._register(
+                lambda x: torch.add(x, x),
+                lambda x: torch.sub(x, x),
+                patterns,
+                pattern_name="invariant_family",
+            )
+            return patterns
+
+        counters.clear()
+        build().apply(self._add_graph())
+        plain = dict(counters["inductor"])
+
+        counters.clear()
+        with (
+            unittest.mock.patch.dict(
+                os.environ, {"TORCHINDUCTOR_PATTERN_MATCH_DEBUG": "all"}
+            ),
+            unittest.mock.patch.object(pattern_matcher, "trace_structured") as trace,
+        ):
+            build().apply(self._add_graph())
+
+        # The artifact is additive: identical counters with debug on and off.
+        self.assertEqual(dict(counters["inductor"]), plain)
+        # A pass that ran and had nothing to report still emits a header-only
+        # artifact, so "no artifact" keeps meaning "the pass did not run".
+        trace.assert_called_once()
+        self.assertEqual(
+            trace.call_args.kwargs["payload_fn"](),
+            "\t".join(
+                ("pass", "node", "target", "pattern", "bucket", "matched", "reason")
+            ),
+        )
+
+    @staticmethod
+    def _attention(scale_form):
+        def fn(query, key, value):
+            attn_mask = torch.ones(
+                query.size(1), key.size(1), dtype=torch.bool, device=query.device
+            ).tril(diagonal=0)
+            attn_mask = attn_mask.masked_fill(
+                torch.logical_not(attn_mask), -float("inf")
+            )
+            q = query.permute(0, 2, 1, 3)
+            k = key.permute(0, 2, 1, 3)
+            v = value.permute(0, 2, 1, 3)
+            scores = torch.matmul(q, k.transpose(-2, -1))
+            scaled = scores.div(3.0) if scale_form == "div" else scores.mul(1.0 / 3.0)
+            return (scaled + attn_mask).softmax(dim=-1).matmul(v)
+
+        return fn
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @inductor_config.patch(force_disable_caches=True)
+    def test_sfdp_family_canary_195412(self):
+        def total(prefix):
+            return sum(
+                value
+                for key, value in counters["inductor"].items()
+                if key.startswith(prefix)
+            )
+
+        args = [torch.randn(4, 2, 16, 32, device=GPU_TYPE) for _ in range(3)]
+        prev = torch.backends.cuda.matmul.fp32_precision
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+        try:
+            seen = {}
+            for form in ("div", "mul"):
+                torch._dynamo.reset()
+                counters.clear()
+                torch.compile(self._attention(form), fullgraph=True)(*args)
+                seen[form] = (
+                    total("pattern_matcher_hit::_sfdp_pattern_14"),
+                    total("pattern_matcher_miss::_sfdp_pattern_14"),
+                )
+        finally:
+            torch.backends.cuda.matmul.fp32_precision = prev
+
+        # div(3.0) is the form pattern 14 recognizes.
+        self.assertGreaterEqual(seen["div"][0], 1, seen)
+        # mul(1/3) is #195412: it never coarse-matches today. Once that issue
+        # is fixed the same graph fuses instead, so accept either outcome -
+        # this only guards that pattern 14 is still reached at all.
+        hit, miss = seen["mul"]
+        self.assertTrue(hit >= 1 or miss >= 1, seen)
+
+
 if __name__ == "__main__":
     if IS_LINUX and HAS_GPU:
         run_tests()

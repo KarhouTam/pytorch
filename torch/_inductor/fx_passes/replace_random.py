@@ -18,7 +18,9 @@ from ..virtualized import V
 
 
 log = logging.getLogger(__name__)
-patterns = PatternMatcherPass(subsystem="joint_graph_passes")
+patterns = PatternMatcherPass(
+    pass_name="replace_random", subsystem="joint_graph_passes"
+)
 aten = torch.ops.aten
 
 

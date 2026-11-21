@@ -112,9 +112,9 @@ prims = torch.ops.prims
 
 # First pass_patterns[0] are applied, then [1], then [2]
 pass_patterns = [
-    PatternMatcherPass(),
-    PatternMatcherPass(),
-    PatternMatcherPass(),
+    PatternMatcherPass(pass_name="pass_pattern_0"),
+    PatternMatcherPass(pass_name="pass_pattern_1"),
+    PatternMatcherPass(pass_name="pass_pattern_2"),
 ]
 
 

@@ -54,14 +54,14 @@ PatternMatcherPass = functools.partial(
 )
 
 log = logging.getLogger(__name__)
-early_patterns = PatternMatcherPass()
-patterns = PatternMatcherPass()
+early_patterns = PatternMatcherPass(pass_name="joint_graph_early")
+patterns = PatternMatcherPass(pass_name="joint_graph")
 aten = torch.ops.aten
 prims = torch.ops.prims
 
 pass_patterns = [
     patterns,
-    PatternMatcherPass(),
+    PatternMatcherPass(pass_name="joint_graph_pass_1"),
 ]
 
 
